@@ -2,8 +2,7 @@ import bpy
 import bmesh
 import os
 import array
-from mathutils import *
-from math import *
+from mathutils import Vector, Quaternion, Matrix
 from bpy_extras.image_utils import load_image
 from . import semodel as SEModel
 
@@ -14,15 +13,16 @@ def __build_image_path__(asset_path, image_path):
 
 
 def load(self, context, filepath=""):
-    ob = bpy.context.object
     scene = bpy.context.scene
     model_name = os.path.splitext(os.path.basename(filepath))[0]
 
+    # Читаем модель
     model = SEModel.Model(filepath)
 
     mesh_objs = []
     mesh_mats = []
 
+    # Материалы
     for mat in model.materials:
         new_mat = bpy.data.materials.get(mat.name)
         if new_mat is not None:
@@ -31,206 +31,162 @@ def load(self, context, filepath=""):
 
         new_mat = bpy.data.materials.new(name=mat.name)
         new_mat.use_nodes = True
-
-        # Localize the shader name so that we get the correct blender node on different language installs.
-        bsdf_shader = new_mat.node_tree.nodes[bpy.app.translations.pgettext_data("Principled BSDF")]
+        bsdf_shader = new_mat.node_tree.nodes[
+            bpy.app.translations.pgettext_data("Principled BSDF")
+        ]
         material_color_map = new_mat.node_tree.nodes.new("ShaderNodeTexImage")
-
         try:
             material_color_map.image = bpy.data.images.load(
-                __build_image_path__(filepath, mat.inputData.diffuseMap))
+                __build_image_path__(filepath, mat.inputData.diffuseMap)
+            )
         except RuntimeError:
             pass
-
         new_mat.node_tree.links.new(
-            bsdf_shader.inputs["Base Color"], material_color_map.outputs["Color"])
-
+            bsdf_shader.inputs["Base Color"],
+            material_color_map.outputs["Color"],
+        )
         mesh_mats.append(new_mat)
 
+    # Меши
     for mesh in model.meshes:
         new_mesh = bpy.data.meshes.new("SEModelMesh")
         blend_mesh = bmesh.new()
 
-        vertex_color_layer = blend_mesh.loops.layers.color.new("Color")
-        vertex_weight_layer = blend_mesh.verts.layers.deform.new()
+        # Цвета, веса, UV
+        vcol_layer = blend_mesh.loops.layers.color.new("Color")
+        vweight_layer = blend_mesh.verts.layers.deform.new()
+        uv_layers = [
+            blend_mesh.loops.layers.uv.new(f"UVSet_{i}")
+            for i in range(mesh.matReferenceCount)
+        ]
 
-        vertex_uv_layers = []
-        for uvLayer in range(mesh.matReferenceCount):
-            vertex_uv_layers.append(
-                blend_mesh.loops.layers.uv.new("UVSet_%d" % uvLayer))
-
-        for vert_idx, vert in enumerate(mesh.vertices):
-            blend_mesh.verts.new(Vector(vert.position))
-
+        # Вершины
+        for v in mesh.vertices:
+            blend_mesh.verts.new(Vector(v.position))
         blend_mesh.verts.ensure_lookup_table()
 
-        # Loop and assign weights, if any
-        for vert_idx, vert in enumerate(mesh.vertices):
-            for weight in vert.weights:
-                # Weights are valid when value is > 0.0
-                if (weight[1] > 0.0):
-                    blend_mesh.verts[vert_idx][vertex_weight_layer][weight[0]] = weight[1]
+        # Веса
+        for idx, v in enumerate(mesh.vertices):
+            for bone_idx, weight in v.weights:
+                if weight > 0.0:
+                    blend_mesh.verts[idx][vweight_layer][bone_idx] = weight
 
-        vertex_normal_buffer = []
+        # Нормали буфер
+        normal_buffer = []
         face_index_map = [0, 2, 1]
 
-        def setup_face_vert(bm_face):
+        def setup_face_vert(bm_face, face):
             for loop_idx, loop in enumerate(bm_face.loops):
                 vert_idx = face.indices[face_index_map[loop_idx]]
+                normal_buffer.append(mesh.vertices[vert_idx].normal)
 
-                # Build buffer of normals
-                vertex_normal_buffer.append(mesh.vertices[vert_idx].normal)
-
-                # Assign vertex uv layers
-                for uvLayer in range(mesh.matReferenceCount):
-                    # Blender also has pathetic uv layout
-                    uv = Vector(mesh.vertices[vert_idx].uvLayers[uvLayer])
+                # UV
+                for ui, uv_layer in enumerate(uv_layers):
+                    uv = Vector(mesh.vertices[vert_idx].uvLayers[ui])
                     uv.y = 1.0 - uv.y
+                    loop[uv_layer].uv = uv
 
-                    # Set the UV to the layer
-                    loop[vertex_uv_layers[uvLayer]].uv = uv
+                # Цвет
+                loop[vcol_layer] = mesh.vertices[vert_idx].color
 
-                # Assign vertex colors
-                loop[vertex_color_layer] = mesh.vertices[vert_idx].color
-
+        # Полигоны
         for face in mesh.faces:
-            indices = [blend_mesh.verts[face.indices[0]],
-                       blend_mesh.verts[face.indices[2]], blend_mesh.verts[face.indices[1]]]
-
+            verts = [
+                blend_mesh.verts[face.indices[0]],
+                blend_mesh.verts[face.indices[2]],
+                blend_mesh.verts[face.indices[1]],
+            ]
             try:
-                new_face = blend_mesh.faces.new(indices)
+                bm_face = blend_mesh.faces.new(verts)
             except ValueError:
                 continue
-            else:
-                setup_face_vert(new_face)
+            setup_face_vert(bm_face, face)
 
+        # Генерим меш
         blend_mesh.to_mesh(new_mesh)
 
-        # Begin vertex normal assignment logic
-        new_mesh.create_normals_split()
-
-        for loop_idx, loop in enumerate(new_mesh.loops):
-            new_mesh.loops[loop_idx].normal = vertex_normal_buffer[loop_idx]
-
+        # === ФИКС для Blender 4.1 ===
         new_mesh.validate(clean_customdata=False)
-
-        clnors = array.array('f', [0.0] * (len(new_mesh.loops) * 3))
-        new_mesh.loops.foreach_get("normal", clnors)
-
-        # Enable smoothing - must be BEFORE normals_split_custom_set, etc.
+        new_mesh.calc_normals()
         polygon_count = len(new_mesh.polygons)
         new_mesh.polygons.foreach_set("use_smooth", [True] * polygon_count)
+        # ============================
 
-        new_mesh.normals_split_custom_set(tuple(zip(*(iter(clnors),) * 3)))
-        new_mesh.use_auto_smooth = True
+        # Создаём объект и привязываем материалы
+        obj = bpy.data.objects.new(f"{model_name}_{new_mesh.name}", new_mesh)
+        for mi in mesh.materialReferences:
+            if mi >= 0:
+                obj.data.materials.append(mesh_mats[mi])
 
-        # Add the mesh to the scene
-        obj = bpy.data.objects.new("%s_%s" % (
-            model_name, new_mesh.name), new_mesh)
+        bpy.context.view_layer.active_layer_collection.collection.objects.link(obj)
         mesh_objs.append(obj)
 
-        # Apply mesh materials
-        for mat_index in mesh.materialReferences:
-            if mat_index < 0:
-                continue
-            obj.data.materials.append(mesh_mats[mat_index])
-
-        bpy.context.view_layer.active_layer_collection.collection.objects.link(
-            obj)
-        bpy.context.view_layer.objects.active = obj
-
-        # Create vertex groups for weights
+        # Группы вершин для скининга
         for bone in model.bones:
             obj.vertex_groups.new(name=bone.name)
 
-    # Create the skeleton
-    armature = bpy.data.armatures.new("%s_amt" % model_name)
-    armature.display_type = "STICK"
-
-    skel_obj = bpy.data.objects.new("%s_skel" % model_name, armature)
+    # Скелет
+    arm = bpy.data.armatures.new(f"{model_name}_amt")
+    arm.display_type = "STICK"
+    skel_obj = bpy.data.objects.new(f"{model_name}_skel", arm)
     skel_obj.show_in_front = True
-
-    bpy.context.view_layer.active_layer_collection.collection.objects.link(
-        skel_obj)
+    bpy.context.view_layer.active_layer_collection.collection.objects.link(skel_obj)
     bpy.context.view_layer.objects.active = skel_obj
 
-    # Begin edit mode
     bpy.ops.object.mode_set(mode='EDIT')
-
     bone_mats = {}
     for bone in model.bones:
-        new_bone = armature.edit_bones.new(bone.name)
-        new_bone.tail = 0, 0.05, 0  # Blender is so bad it removes bones if they have 0 length
-
-        # Calculate local-space position matrix
-        mat_rot = Quaternion((bone.localRotation[3], bone.localRotation[0],
-                              bone.localRotation[1], bone.localRotation[2])).to_matrix().to_4x4()
+        eb = arm.edit_bones.new(bone.name)
+        eb.tail = (0, 0.05, 0)
+        mat_rot = Quaternion((
+            bone.localRotation[3],
+            bone.localRotation[0],
+            bone.localRotation[1],
+            bone.localRotation[2],
+        )).to_matrix().to_4x4()
         mat_trans = Matrix.Translation(Vector(bone.localPosition))
-
-        final_mat = mat_trans @ mat_rot
-
-        bone_mats[bone.name] = final_mat
-
-        # Set parent if we have any
+        final = mat_trans @ mat_rot
+        bone_mats[bone.name] = final
         if bone.boneParent > -1:
-            new_bone.parent = armature.edit_bones[bone.boneParent]
+            eb.parent = arm.edit_bones[model.bones[bone.boneParent].name]
 
-    bpy.context.view_layer.objects.active = skel_obj
     bpy.ops.object.mode_set(mode='POSE')
-
-    for bone in skel_obj.pose.bones:
-        bone.matrix_basis.identity()
-        bone.matrix = bone_mats[bone.name]
-
+    for pb in skel_obj.pose.bones:
+        pb.matrix_basis.identity()
+        pb.matrix = bone_mats[pb.name]
     bpy.ops.pose.armature_apply()
 
-    # Create natural bone-line structure
-    bpy.ops.object.mode_set(mode='EDIT', toggle=False)
+    # Отображение костей
+    bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, radius=2)
-    bone_vis = bpy.context.active_object
-    bone_vis.data.name = bone_vis.name = "semodel_bone_vis"
-    bone_vis.use_fake_user = True
-    bpy.context.view_layer.active_layer_collection.collection.objects.unlink(
-        bone_vis)
+    vis = bpy.context.active_object
+    vis.name = vis.data.name = "semodel_bone_vis"
+    vis.use_fake_user = True
+    bpy.context.view_layer.active_layer_collection.collection.objects.unlink(vis)
     bpy.context.view_layer.objects.active = skel_obj
 
-    # Calculate armature dimensions...
-    maxs = [0, 0, 0]
+    # Подгон Tail для всех костей
+    bpy.ops.object.mode_set(mode='EDIT', toggle=False)
+    dims = [0, 0, 0]
     mins = [0, 0, 0]
-
-    j = 0
-    for bone in armature.bones:
+    for b in arm.bones:
         for i in range(3):
-            maxs[i] = max(maxs[i], bone.head_local[i])
-            mins[i] = min(mins[i], bone.head_local[i])
-
-    dimensions = []
-    for i in range(3):
-        dimensions.append(maxs[i] - mins[i])
-
-    # very small indeed, but a custom bone is used for display
-    length = max(0.001, (dimensions[0] + dimensions[1] + dimensions[2]) / 600)
-
-    # Apply spheres
-    bpy.ops.object.mode_set(mode='EDIT')
-    for bone in [armature.edit_bones[b.name] for b in model.bones]:
+            dims[i] = max(dims[i], b.head_local[i])
+            mins[i] = min(mins[i], b.head_local[i])
+    length = max(0.001, sum(dims[i] - mins[i] for i in range(3)) / 600)
+    for bone in [arm.edit_bones[b.name] for b in model.bones]:
         bone.tail = bone.head + (bone.tail - bone.head).normalized() * length
-        skel_obj.pose.bones[bone.name].custom_shape = bone_vis
+        skel_obj.pose.bones[bone.name].custom_shape = vis
 
-    # Reset the view mode
+    # Назначаем модификатор Armature
     bpy.ops.object.mode_set(mode='OBJECT')
+    for obj in mesh_objs:
+        obj.parent = skel_obj
+        mod = obj.modifiers.new("Armature Rig", "ARMATURE")
+        mod.object = skel_obj
+        mod.use_bone_envelopes = False
+        mod.use_vertex_groups = True
 
-    # Set armature deform for weights
-    for mesh_obj in mesh_objs:
-        mesh_obj.parent = skel_obj
-        modifier = mesh_obj.modifiers.new('Armature Rig', 'ARMATURE')
-        modifier.object = skel_obj
-        modifier.use_bone_envelopes = False
-        modifier.use_vertex_groups = True
-
-    # Update the scene
     bpy.context.view_layer.update()
-
-    # Reset the view mode
     bpy.ops.object.mode_set(mode='OBJECT')
     return True
